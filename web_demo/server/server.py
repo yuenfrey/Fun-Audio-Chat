@@ -53,6 +53,20 @@ from utils.cosyvoice_detokenizer import get_audio_detokenizer, tts_infer_streami
 def log(level, message):
     print(f"[{level.upper()}] {message}")
 
+
+def estimate_rms(pcm: np.ndarray) -> float:
+    if pcm is None or len(pcm) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(pcm.astype(np.float32)))))
+
+
+# Auto VAD / turn-taking parameters for full-duplex style interaction
+AUTO_VAD_RMS_THRESHOLD = 0.008
+AUTO_COMMIT_SILENCE_SEC = 0.9
+AUTO_MIN_UTTERANCE_SEC = 0.6
+AUTO_COMMIT_COOLDOWN_SEC = 0.6
+AUTO_BARGE_IN_COOLDOWN_SEC = 0.5
+
 def tts_worker_process(input_queue: MPQueue, output_queue: MPQueue, control_queue: MPQueue, tts_gpu: int = 1):
     """
     TTS independent process1, avoiding Python GIL
@@ -291,7 +305,6 @@ class ServerState:
                             elif action == 'start':
                                 log("info", f"Received START signal")
                                 is_recording = True
-                                turn_counter += 1
                                 await save_audio_queue.put(('start', None))
                             elif action == 'endTurn':
                                 log("info", f"Received END_TURN signal")
@@ -336,7 +349,6 @@ class ServerState:
                         elif kind == 3:  # start signal
                             log("info", f"Received START signal (old)")
                             is_recording = True
-                            turn_counter += 1
                             await save_audio_queue.put(('start', None))
                         
             finally:
@@ -345,7 +357,7 @@ class ServerState:
 
         async def save_audio_loop():
             """Async tasks for handling audio saving and inference"""
-            nonlocal all_recorded_pcm, turn_counter, messages, audio_list, audio_buffer_list, audio_buffer_lock, all_generated_audio, reset_first_frame, reset_send_state, this_uuid, tts_offset, cur_audio_tokens, opus_reader, accumulate_tts_tokens
+            nonlocal all_recorded_pcm, turn_counter, messages, audio_list, audio_buffer_list, audio_buffer_lock, all_generated_audio, reset_first_frame, reset_send_state, this_uuid, tts_offset, cur_audio_tokens, opus_reader, accumulate_tts_tokens, auto_turn_state, runtime_flags
             
             current_generation = {
                 'streamer': None,
@@ -461,6 +473,7 @@ class ServerState:
                             current_generation['accumulated_text'] = ""
                             current_generation['generation_thread'] = generation_thread
                             current_generation['is_generating'] = True
+                            runtime_flags['generation_active'] = True
                             
                             last_step = 0
                             accumulated_text = ""
@@ -551,6 +564,7 @@ class ServerState:
                                 current_generation['streamer'] = None
                                 current_generation['accumulated_text'] = ''
                                 current_generation['generation_thread'] = None
+                                runtime_flags['generation_active'] = False
                                 continue 
                             
                             # Mark TTS generation as complete
@@ -628,12 +642,15 @@ class ServerState:
                             current_generation['streamer'] = None
                             current_generation['accumulated_text'] = ''
                             current_generation['generation_thread'] = None
+                            runtime_flags['generation_active'] = False
                             
                             log("info", f"Processing completed")
                         else:
                             log("warning", "No audio data to save")
                     
                     elif signal_type == 'start':
+                        turn_counter += 1
+                        auto_turn_state['last_commit_ts'] = time.time()
                         # If there is an ongoing inference, set the interrupt flag and wait
                         if current_generation['is_generating']:
                             log("info", "Interrupting current generation...")
@@ -644,6 +661,7 @@ class ServerState:
                                     log("warning", "Generation thread did not stop in time")
                             current_generation['is_generating'] = False
                             current_generation['interrupt'] = False
+                            runtime_flags['generation_active'] = False
                             log("info", "Previous generation stopped")
                         
                         all_recorded_pcm = None
@@ -717,6 +735,7 @@ class ServerState:
                     continue
                 except Exception as e:
                     log("error", f"Inference failed: {e}")
+                    runtime_flags['generation_active'] = False
                     import traceback
                     traceback.print_exc()
                     try:
@@ -726,7 +745,7 @@ class ServerState:
                         pass
 
         async def accumulate_pcm_loop():
-            nonlocal all_recorded_pcm
+            nonlocal all_recorded_pcm, is_recording, auto_turn_state
             total_samples = 0
             last_all_recorded_pcm_id = id(all_recorded_pcm) if all_recorded_pcm is not None else None
             
@@ -753,11 +772,50 @@ class ServerState:
                     pcm_samples = len(pcm)
                     total_samples += pcm_samples
                     log("info", f"Accumulating PCM: {pcm_samples} samples (total: {total_samples}, {total_samples/self.sample_rate:.2f}s)")
+
+                    rms = estimate_rms(pcm)
+                    now_ts = time.time()
+                    if rms >= AUTO_VAD_RMS_THRESHOLD:
+                        auto_turn_state['last_voice_ts'] = now_ts
+                        auto_turn_state['voice_detected'] = True
+
+                        # Barge-in: if user starts speaking while assistant is generating, interrupt immediately
+                        if runtime_flags['generation_active'] and (now_ts - auto_turn_state['last_barge_in_ts']) > AUTO_BARGE_IN_COOLDOWN_SEC:
+                            log("info", f"Auto barge-in triggered (rms={rms:.4f}), interrupting current generation")
+                            auto_turn_state['last_barge_in_ts'] = now_ts
+                            await save_audio_queue.put(('start', None))
                     
                     if all_recorded_pcm is None:
                         all_recorded_pcm = pcm
                     else:
                         all_recorded_pcm = np.concatenate((all_recorded_pcm, pcm))
+                else:
+                    # Auto restart listening when user speech is detected after a committed turn
+                    rms = estimate_rms(pcm)
+                    now_ts = time.time()
+                    if rms >= AUTO_VAD_RMS_THRESHOLD and (now_ts - auto_turn_state['last_commit_ts']) > AUTO_COMMIT_COOLDOWN_SEC:
+                        log("info", f"Auto START triggered by speech activity (rms={rms:.4f})")
+                        is_recording = True
+                        auto_turn_state['last_voice_ts'] = now_ts
+                        auto_turn_state['voice_detected'] = True
+                        await save_audio_queue.put(('start', None))
+
+                # Auto commit current utterance when silence is long enough
+                if is_recording and all_recorded_pcm is not None and len(all_recorded_pcm) > 0:
+                    now_ts = time.time()
+                    recorded_sec = len(all_recorded_pcm) / self.sample_rate
+                    silence_sec = now_ts - auto_turn_state['last_voice_ts']
+                    if (
+                        auto_turn_state['voice_detected']
+                        and recorded_sec >= AUTO_MIN_UTTERANCE_SEC
+                        and silence_sec >= AUTO_COMMIT_SILENCE_SEC
+                        and (now_ts - auto_turn_state['last_commit_ts']) >= AUTO_COMMIT_COOLDOWN_SEC
+                    ):
+                        is_recording = False
+                        auto_turn_state['last_commit_ts'] = now_ts
+                        auto_turn_state['voice_detected'] = False
+                        log("info", f"Auto END_TURN triggered after silence {silence_sec:.2f}s (recorded={recorded_sec:.2f}s)")
+                        await save_audio_queue.put(('pause', None))
 
         def tts_sender_thread_func():
             """[Multiprocessing] Send audio tokens to the TTS process"""
@@ -995,11 +1053,9 @@ class ServerState:
             log("info", f"Send coroutine stopped, total frames sent: {frames_sent}")
 
         async def send_text_loop():
-            """Asynchronous coroutine: Read text from the text buffer queue and send it at 200ms intervals after audio transmission begins."""
-            nonlocal audio_send_started
+            """Asynchronous coroutine: Read text from the text buffer queue and send it at 200ms intervals."""
             text_interval = 0.2  # 200ms per text
             texts_sent = 0
-            current_turn_started = False  
             
             log("info", "Text send coroutine started")
             
@@ -1008,23 +1064,8 @@ class ServerState:
                     try:
                         text = text_buffer_queue.get_nowait()
                     except queue.Empty:
-                        if current_turn_started and not audio_send_started['flag']:
-                            current_turn_started = False
-                            log("info", "New turn detected, resetting text send state")
                         await asyncio.sleep(0.05)
                         continue
-                    
-                    if not current_turn_started:
-                        log("info", f"Waiting for audio to start before sending text: '{text[:20]}...'")
-                        while not close and not audio_send_started['flag']:
-                            await asyncio.sleep(0.05)
-                        
-                        if close:
-                            log("info", "Text send coroutine stopped while waiting for audio")
-                            break
-                        
-                        current_turn_started = True
-                        log("info", "Audio started, beginning text transmission at 200ms intervals")
                     
                     try:
                         msg = b"\x02" + bytes(text, encoding="utf8")
@@ -1066,6 +1107,13 @@ class ServerState:
         max_tts_tokens = MAX_TTS_TOKENS
         this_uuid = str(uuid.uuid4())
         tts_state_lock = threading.Lock()  # Protect cur_audio_tokens, tts_offset, this_uuid
+        runtime_flags = {'generation_active': False}
+        auto_turn_state = {
+            'last_voice_ts': time.time(),
+            'last_commit_ts': 0.0,
+            'last_barge_in_ts': 0.0,
+            'voice_detected': False,
+        }
         
         # TTS 
         tts_input_queue = self.tts_input_queue
