@@ -19,7 +19,7 @@ export const encodeMessage = (message: WSMessage): Uint8Array => {
     case "text":
       return new Uint8Array([0x02, ...new TextEncoder().encode(message.data)]);
     case "coloredtext":
-      return new Uint8Array([0x02, 0x05, ...new TextEncoder().encode(message.data)]);
+      return new Uint8Array([0x07, message.color, ...new TextEncoder().encode(message.data)]);
     case "control":
       return new Uint8Array([0x03, CONTROL_MESSAGES_MAP[message.action]]);
     case "metadata":

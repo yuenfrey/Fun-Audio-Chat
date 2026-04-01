@@ -23,7 +23,7 @@ export const useSocket = ({
       }
       socket.send(encodeMessage(message));
     },
-    [isConnected],
+    [isConnected, socket],
   );
 
   const onConnect = useCallback(() => {

@@ -21,7 +21,6 @@ export const Queue: FC = () => {
   const overrideWorkerAddr = searchParams.get("worker_addr");
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
   const [showMicrophoneAccessMessage, setShowMicrophoneAccessMessage] = useState<boolean>(false);
-  const [shouldConnect, setShouldConnect] = useState<boolean>(false);
   const [connectionMode, setConnectionMode] = useState<ConversationMode | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string>("");
   const modelParams = useModelParams({
@@ -85,9 +84,8 @@ export const Queue: FC = () => {
     const hasAccess = await getMicrophoneAccess();
     if (hasAccess) {
       setConnectionMode(mode);
-      setShouldConnect(true);
     }
-  }, [setShouldConnect, startProcessor, getMicrophoneAccess, setConnectionMode]);
+  }, [startProcessor, getMicrophoneAccess, setConnectionMode]);
 
   if (hasMicrophoneAccess && audioContext.current && worklet.current && connectionMode) {
     // workerAddr 直接使用模式名，Vite 代理会根据路径转发
